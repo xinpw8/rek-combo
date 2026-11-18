@@ -107,6 +107,23 @@ Analysis scripts:
 | `chain_mine.py` | Move pairs that chain. |
 | `combo_rule.py`, `combo_chain_test.py` | What the game counts as a combo. |
 
+## Extending it
+
+The fight-state source, the decisions and the output are separate layers. You can swap the first and last from the
+command line:
+
+```
+py rek_combo.py --state examples.replay_state:ReplayState --backend examples.move_backend:MoveBackend
+```
+
+- `examples/move_backend.py` turns the chosen chords into move names (`shanghai_leg2`, `big_kick`, ...) instead of
+  typing them into REK.
+- `examples/replay_state.py` replays a logged fight, so you can work without REK running.
+- `examples/headless.py` plays a chain from code with no pad, which is the starting point for an AI opponent.
+
+[EXTENDING.md](EXTENDING.md) covers the state format, the backend contract, adding combos, and using the decision
+logic for a REK AI opponent.
+
 ## Tests
 
 `py selftest.py` checks the engine: chord timing, triggers, aim, chains and rescue. It injects keys with its own tag
@@ -122,3 +139,9 @@ and swallows them in a keyboard hook, so run it while REK isn't focused.
 | `combos.json` | Combos and settings, hot-reloaded. |
 | `turn_table.json`, `land_table.json`, `shot_model.json` | Measured tables. |
 | `start.bat` | Launcher. |
+| `examples/` | A move-name backend, a replay state source and a headless driver. |
+| `EXTENDING.md` | How to plug in other state sources, outputs and combos. |
+
+## License
+
+MIT. See [LICENSE](LICENSE).

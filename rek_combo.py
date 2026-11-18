@@ -29,6 +29,7 @@ import argparse
 import collections
 import ctypes
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -112,7 +113,12 @@ SCAN = _scan_table()
 
 
 class Keyboard:
-    """Sends physical-position key events and remembers what is held."""
+    """Sends physical-position key events and remembers what is held.
+
+    This is the default input backend. Any object with the same four members can replace it (--backend, EXTENDING.md):
+    down(name) and up(name) take REK key names such as "LeftShift" or "Y", release_all() lets go of everything, and
+    held lists the names that are down. needs_focus False means the backend doesn't type into REK's window."""
+    needs_focus = True
 
     def __init__(self, dry_run=False):
         self.dry_run = dry_run
@@ -865,11 +871,17 @@ class ComboChain:
                 self.moves += (credited,)
 
 
-class Aim(threading.Thread):
-    """Keeps the newest fight state from rek_mem (read-only) about 30 times a second."""
+class Unavailable(Exception):
+    """A state source raises this from read() while there is no fight to read (EXTENDING.md)."""
 
-    def __init__(self):
+
+class Aim(threading.Thread):
+    """Keeps the newest fight state about 30 times a second: from rek_mem (read-only) by default, or from any object
+    with a read() that returns the same dict (--state, EXTENDING.md)."""
+
+    def __init__(self, reader=None):
         super().__init__(daemon=True)
+        self.reader = reader
         self.state = None
         self.stamp = 0.0
         self.offset_deg = 45.0
@@ -886,12 +898,16 @@ class Aim(threading.Thread):
         self.enemy_up_at = None  # when the other robot was last seen getting back up, by the local clock
 
     def run(self):
-        try:
-            import rek_mem
-        except ImportError as error:
-            say(f"!! live aim is off: {error}")
-            return
-        reader = rek_mem.FightReader()
+        if self.reader is not None:
+            make_reader, unavailable = (lambda: self.reader), Unavailable
+        else:
+            try:
+                import rek_mem
+            except ImportError as error:
+                say(f"!! live aim is off: {error}")
+                return
+            make_reader, unavailable = rek_mem.FightReader, (rek_mem.Unavailable, Unavailable)
+        reader = make_reader()
         previous = reported = None
         while True:
             try:
@@ -920,13 +936,13 @@ class Aim(threading.Thread):
                 self.enemy_down = down
                 if state.get("hits"):
                     self.chain.update(self.stamp, state["round"], state["hits"][0], me["move"], state["hits"][1])
-            except rek_mem.Unavailable:
+            except unavailable:
                 self.state = previous = None
                 self.rate = 0.0
             except Exception as error:  # every macro needs this thread, so one bad read must not end it
                 self.state = previous = None
                 self.rate = 0.0
-                reader = rek_mem.FightReader()
+                reader = make_reader()
                 if repr(error) != reported:
                     reported = repr(error)
                     say(f"!! live aim error, reconnecting: {reported}")
@@ -2164,6 +2180,34 @@ def watch_pad():
         time.sleep(0.004)
 
 
+def use_game_dir(game_dir=None):
+    """Points the module at a REK install (found automatically when None). False if there is none."""
+    global GAME_DIR, BAKED
+    found = rek_paths.find_game_dir(game_dir)
+    if found is None:
+        return False
+    GAME_DIR, BAKED = found, found.joinpath(*rek_paths.BAKED_PARTS)
+    return True
+
+
+def make_aim(config, game, reader=None):
+    """The fight-state thread, set up for this build and config (not started yet)."""
+    aim = Aim(reader)
+    aim.offset_deg = config.facing_offset_deg
+    aim.chain.recovery_id = game.move_ids["auto_recovery"]
+    aim.down_ids = frozenset(game.move_ids[m] for m in ("auto_recovery", "liyudating_getup", "liyudating", "stance_to_supine") if m in game.move_ids)
+    aim.strike_ids = strike_move_ids(game, aim.down_ids)
+    return aim
+
+
+def load_plugin(spec):
+    """'module:name' -> that object. Modules are imported from this folder, so examples.move_backend:MoveBackend works."""
+    module, _, name = spec.partition(":")
+    if not module or not name:
+        raise SystemExit(f"expected MODULE:NAME, got {spec!r}")
+    return getattr(importlib.import_module(module), name)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, default=HERE / "combos.json")
@@ -2175,14 +2219,15 @@ def main():
     parser.add_argument("--keyboard-contract", type=Path,
                         help="verify a preserved native keyboard table before accepting its custom slot")
     parser.add_argument("--game-dir", type=Path, help="the folder that holds REK.exe (found automatically when omitted)")
+    parser.add_argument("--state", metavar="MODULE:NAME",
+                        help="read the fight from this state source instead of REK's memory (EXTENDING.md)")
+    parser.add_argument("--backend", metavar="MODULE:NAME",
+                        help="send moves through this backend instead of the Windows keyboard (EXTENDING.md)")
     args = parser.parse_args()
 
-    global GAME_DIR, BAKED
-    found = rek_paths.find_game_dir(args.game_dir)
-    if found is None:
+    if not use_game_dir(args.game_dir):
         print(rek_paths.NOT_FOUND)
         return 2
-    GAME_DIR, BAKED = found, found.joinpath(*rek_paths.BAKED_PARTS)
 
     winmm.timeBeginPeriod(1)
     kernel32.SetPriorityClass(wintypes.HANDLE(-1), 0x8000)  # this process, above normal: the hook and the presses never queue behind the game
@@ -2212,18 +2257,17 @@ def main():
         time.sleep(0.2)
         return 1
 
-    keyboard = Keyboard(dry_run=args.dry_run)
-    if not args.no_startup_key_release:
+    if args.backend:
+        keyboard = load_plugin(args.backend)(game=game, dry_run=args.dry_run)
+    else:
+        keyboard = Keyboard(dry_run=args.dry_run)
+    if isinstance(keyboard, Keyboard) and not args.no_startup_key_release:
         for name in ("LeftShift", *"YUHJIOKL"):  # a copy killed mid-chord leaves its keys logically down
             keyboard._send(SCAN[name], False)
     session = Session()
-    aim = Aim()
-    aim.offset_deg = config.facing_offset_deg
-    aim.chain.recovery_id = game.move_ids["auto_recovery"]
-    aim.down_ids = frozenset(game.move_ids[m] for m in ("auto_recovery", "liyudating_getup", "liyudating", "stance_to_supine") if m in game.move_ids)
-    aim.strike_ids = strike_move_ids(game, aim.down_ids)
+    aim = make_aim(config, game, load_plugin(args.state)(game=game) if args.state else None)
     aim.start()
-    player = Player(keyboard, session, require_focus=not args.dry_run, aim=aim)
+    player = Player(keyboard, session, require_focus=not args.dry_run and getattr(keyboard, "needs_focus", True), aim=aim)
 
     # Closing the window must not leave Shift logically held down.
     handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
@@ -2367,4 +2411,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.modules.setdefault("rek_combo", sys.modules[__name__])  # plug-ins that import rek_combo get this running copy
     sys.exit(main())
