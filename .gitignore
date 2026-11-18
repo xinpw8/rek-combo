@@ -1,0 +1,6 @@
+logs/
+__pycache__/
+STOP
+staged/
+versions/
+keyboard_contract.json
